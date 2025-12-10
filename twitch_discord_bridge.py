@@ -1,8 +1,10 @@
 """DiscordとTwitchを連携させる橋渡しBot"""
-# 日本語コメント: 非同期処理や環境変数、ロギングを扱うための標準ライブラリ
+# 日本語コメント: 非同期処理や環境変数、ロギング、およびハッシュ生成と正規表現を扱うための標準ライブラリ
 import asyncio
+import hashlib
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass
 from contextlib import suppress
@@ -174,10 +176,13 @@ class TwitchDiscordBridge:
         twitch_client_id: str,
         twitch_client_secret: str,
         twitch_channels: list[str],
+        discord_notification_channel_id: int | None = None,
     ) -> None:
         # 日本語コメント: DiscordとTwitch双方の認証情報を保持
         self._discord_token = discord_token
         self._discord_channel_id = discord_channel_id
+        # 日本語コメント: 配信開始などの通知を送るためのDiscordチャンネルID（未設定時はNone）
+        self._discord_notification_channel_id = discord_notification_channel_id
         self._twitch_client_id = twitch_client_id
         self._twitch_client_secret = twitch_client_secret
         self._twitch_channels = twitch_channels
@@ -338,9 +343,18 @@ class TwitchDiscordBridge:
 
     async def _resolve_channel(self) -> Messageable:
         """送信先のDiscordチャンネルを取得"""
-        channel = self._discord_bot.get_channel(self._discord_channel_id)
+        return await self._resolve_channel_by_id(self._discord_channel_id)
+
+    async def _resolve_notification_channel(self) -> Messageable:
+        """通知専用のDiscordチャンネルを取得（未指定なら中継先を再利用）"""
+        target_channel_id = self._discord_notification_channel_id or self._discord_channel_id
+        return await self._resolve_channel_by_id(target_channel_id)
+
+    async def _resolve_channel_by_id(self, channel_id: int) -> Messageable:
+        """指定IDのチャンネルを取得し、メッセージ送信可能か検証"""
+        channel = self._discord_bot.get_channel(channel_id)
         if channel is None:
-            channel = await self._discord_bot.fetch_channel(self._discord_channel_id)
+            channel = await self._discord_bot.fetch_channel(channel_id)
         if not isinstance(channel, Messageable):
             raise RuntimeError("指定したDiscordチャンネルはメッセージ送信に対応していません。")
         return channel
@@ -354,6 +368,8 @@ class TwitchDiscordBridge:
                 previous_live_channels = self._live_channels
                 self._live_channels = live_channels
                 self._live_streams = live_streams
+                started_channels = live_channels - previous_live_channels
+                ended_channels = previous_live_channels - live_channels
                 previous = self._is_live_blocked
                 self._is_live_blocked = bool(live_channels)
                 self._is_stream_status_known = True
@@ -365,10 +381,45 @@ class TwitchDiscordBridge:
                 elif not self._is_live_blocked and previous:
                     joined = ", ".join(sorted(previous_live_channels))
                     logging.info("Twitch配信が終了したため中継を再開します。（終了: %s）", joined)
+                await self._send_stream_notifications(started_channels, ended_channels, live_streams)
                 self._refresh_relay_gate()
             except Exception:
                 logging.exception("Twitchの配信状況チェックに失敗しました。一定時間後に再試行します。")
             await asyncio.sleep(self._stream_check_interval)
+
+    async def _send_stream_notifications(
+        self,
+        started_channels: set[str],
+        ended_channels: set[str],
+        live_streams: dict[str, StreamInfo],
+    ) -> None:
+        """配信開始/終了の差分を通知チャンネルへ送信"""
+        if not started_channels and not ended_channels:
+            return
+        try:
+            channel = await self._resolve_notification_channel()
+        except Exception:
+            logging.exception("通知チャンネルの取得に失敗したため、配信通知を送信できませんでした。")
+            return
+        # 日本語コメント: 配信開始したチャンネルを新着順で通知
+        for login in sorted(started_channels):
+            info = live_streams.get(login)
+            stream_url = f"https://www.twitch.tv/{login}"
+            title = (info.title if info else "") or "（タイトル未設定）"
+            message = f"{login} の配信が開始されました: {title}\n{stream_url}"
+            embed = self._build_status_embed(login)
+            try:
+                await channel.send(message, embed=embed)
+            except Exception:
+                logging.exception("配信開始通知の送信に失敗しました: %s", login)
+        # 日本語コメント: 配信終了チャンネルも順次通知
+        for login in sorted(ended_channels):
+            message = f"{login} の配信が終了しました。"
+            embed = self._build_status_embed(login)
+            try:
+                await channel.send(message, embed=embed)
+            except Exception:
+                logging.exception("配信終了通知の送信に失敗しました: %s", login)
 
     async def _fetch_stream_live_streams(self) -> dict[str, StreamInfo]:
         """Helix Streams APIから対象チャンネルの配信状況を取得"""
@@ -544,19 +595,52 @@ class TwitchDiscordBridge:
         return text if channel_name.lower() == "hikakin" else escape_mentions(text)
 
     def _replace_custom_tokens(self, text: str, channel_name: str, guild: discord.Guild) -> str:
-        """公式タグ以外のカスタムエモート名をDiscord絵文字へ置換"""
-        tokens = text.split(" ")
-        replaced: list[str] = []
+        """公式タグ以外のカスタムエモート名をDiscord絵文字へ置換（句読点に挟まれた場合も検出）"""
         emote_map = self._custom_emotes.get(channel_name.lower()) or {}
-        for token in tokens:
+        pattern = re.compile(r"(?<![A-Za-z0-9_])(:?[A-Za-z0-9_]+:?)(?![A-Za-z0-9_])")
+        cursor = 0
+        replaced: list[str] = []
+        for match in pattern.finditer(text):
+            start, end = match.span()
+            if cursor < start:
+                segment = text[cursor:start]
+                replaced.append(self._safe_text(segment, channel_name))
+            raw_token = match.group(0)
+            token = raw_token[1:-1] if raw_token.startswith(":") and raw_token.endswith(":") and len(raw_token) > 2 else raw_token
             url = emote_map.get(token)
             if url:
                 emoji_str = self._get_cached_custom_emoji(token, url, guild)
                 if emoji_str:
                     replaced.append(emoji_str)
+                    cursor = end
                     continue
-            replaced.append(self._safe_text(token, channel_name))
-        return " ".join(replaced)
+            replaced.append(self._safe_text(raw_token, channel_name))
+            cursor = end
+        if cursor < len(text):
+            remainder = text[cursor:]
+            replaced.append(self._safe_text(remainder, channel_name))
+        return "".join(replaced)
+
+    def _build_safe_emoji_name(self, source: str) -> str:
+        """Discord仕様（32文字制限と英数字/アンダースコア制限）を満たす絵文字名へ正規化"""
+        prefix = "tw_"
+        max_length = 32
+        normalized_chars: list[str] = []
+        base_text = source or "emote"
+        for char in base_text.lower():
+            normalized_chars.append(char if char.isalnum() else "_")
+        normalized = "".join(normalized_chars).strip("_")
+        if not normalized:
+            normalized = "emote"
+        max_body = max_length - len(prefix)
+        if len(normalized) > max_body:
+            digest = hashlib.sha1(base_text.encode("utf-8", "ignore")).hexdigest()[:6]
+            head_len = max_body - 7
+            if head_len < 1:
+                normalized = digest[:max_body]
+            else:
+                normalized = f"{normalized[:head_len]}_{digest}"
+        return f"{prefix}{normalized}"
 
     def _get_cached_custom_emoji(self, name: str, url: str, guild: discord.Guild) -> str | None:
         """既存のカスタム絵文字をURLキーで検索"""
@@ -588,9 +672,22 @@ class TwitchDiscordBridge:
             if existing:
                 return str(existing)
 
-        # 日本語コメント: 既存の絵文字を名前ベースで検索（再生成を避ける）
+        # 日本語コメント: 既存の絵文字を名前ベースで検索（再生成を避ける）。正規化済み+旧フォーマットの候補で比較
+        preferred_name = self._build_safe_emoji_name(emote_id)
+        fallback_name = self._build_safe_emoji_name(emote_name or emote_id)
+        raw_candidates = [
+            preferred_name,
+            fallback_name,
+            f"tw_{emote_id}",
+        ]
+        if emote_name:
+            raw_candidates.append(f"tw_{emote_name.lower()}")
+        name_candidates: list[str] = []
+        for candidate in raw_candidates:
+            if candidate and candidate not in name_candidates:
+                name_candidates.append(candidate)
         for emoji in guild.emojis:
-            if emoji.name == f"tw_{emote_id}" or (image_url and emoji.name == f"tw_{emote_name.lower()}"):
+            if emoji.name in name_candidates:
                 self._emoji_cache[cache_key] = emoji.id
                 return str(emoji)
 
@@ -619,8 +716,15 @@ class TwitchDiscordBridge:
             logging.warning("エモート画像の取得に失敗しました: %s", emote_id)
             return None
 
-        safe_base = emote_name.lower()
-        safe_name = f"tw_{safe_base}"
+        # 日本語コメント: 正規化済み候補が衝突する場合はハッシュ付きの末尾を付与して一意な名前を確保
+        existing_names = {emoji.name for emoji in guild.emojis}
+        safe_name = preferred_name if preferred_name not in existing_names else fallback_name
+        if safe_name in existing_names:
+            digest = hashlib.sha1((emote_id or emote_name or "emote").encode("utf-8", "ignore")).hexdigest()[:6]
+            safe_name = self._build_safe_emoji_name(f"{emote_name or emote_id}_{digest}")
+            if safe_name in existing_names:
+                logging.debug("既存絵文字名と衝突したため新規作成をスキップします: %s", safe_name)
+                return None
         try:
             emoji = await guild.create_custom_emoji(name=safe_name, image=image_bytes, reason="Twitch emote import")
         except Exception:
@@ -714,6 +818,14 @@ async def main() -> None:
     load_dotenv()
     discord_token = require_env("DISCORD_BOT_TOKEN")
     discord_channel_id = require_int_env("DISCORD_CHANNEL_ID")
+    # 日本語コメント: 配信通知専用チャンネルIDは任意指定のため個別で変換
+    notification_channel_id: int | None = None
+    raw_notification_channel_id = os.getenv("DISCORD_NOTIFICATION_CHANNEL_ID", "").strip()
+    if raw_notification_channel_id:
+        try:
+            notification_channel_id = int(raw_notification_channel_id)
+        except ValueError as exc:
+            raise MissingSettingError("DISCORD_NOTIFICATION_CHANNEL_ID には整数を設定してください。") from exc
     twitch_token = require_env("TWITCH_OAUTH_TOKEN")
     twitch_client_id = require_env("TWITCH_CLIENT_ID")
     twitch_client_secret = require_env("TWITCH_CLIENT_SECRET")
@@ -731,6 +843,7 @@ async def main() -> None:
     bridge = TwitchDiscordBridge(
         discord_token=discord_token,
         discord_channel_id=discord_channel_id,
+        discord_notification_channel_id=notification_channel_id,
         twitch_token=twitch_token,
         twitch_client_id=twitch_client_id,
         twitch_client_secret=twitch_client_secret,

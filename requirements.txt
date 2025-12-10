@@ -2,3 +2,4 @@ discord.py>=2.3.2
 python-dotenv>=1.0.1
 twitchio>=2.8.2
 aiohttp>=3.9.5
+googletrans==4.0.0-rc1

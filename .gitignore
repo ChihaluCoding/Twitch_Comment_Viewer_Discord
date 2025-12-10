@@ -1,3 +1,5 @@
 /.env
 /AGENTS.md
 /__pycache__
+prev_bridge.py
+requirements.txt
